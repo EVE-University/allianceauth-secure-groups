@@ -5,7 +5,9 @@ from django.contrib.auth.models import Group, User
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
+from django.urls import NoReverseMatch, reverse
 from django.utils import timezone
+from django.utils.html import format_html, format_html_join
 
 from allianceauth.authentication.models import CharacterOwnership
 from allianceauth.eveonline.models import (
@@ -19,6 +21,73 @@ if app_settings.discord_bot_active():
     import aadiscordbot
 
 logger = get_extension_logger(__name__)
+
+
+def _format_exemptions_html(alliances, corporations) -> str:
+    """Human-readable HTML fragment describing exempt alliances/corporations, or "" if none."""
+    alliance_names = [a.alliance_name for a in alliances]
+    corp_names = [c.corporation_name for c in corporations]
+    if not alliance_names and not corp_names:
+        return ""
+    bits = []
+    if alliance_names:
+        bits.append(format_html("alliance(s) {}", ", ".join(alliance_names)))
+    if corp_names:
+        bits.append(format_html("corporation(s) {}", ", ".join(corp_names)))
+    return format_html(
+        " (exempt regardless of the above if main character is in {})",
+        format_html_join(" or ", "{}", ((b,) for b in bits))
+    )
+
+
+EXPLAIN_INDENT = "1em"
+
+
+def _auto_explain(instance) -> str:
+    """
+    Generic, introspection-based explanation for a filter object that has no
+    `explain()` of its own. Many apps (e.g. allianceauth-corp-tools) define
+    their own filter models that duck-type securegroups' FilterBase rather
+    than subclassing it, so this must work off the model's own fields alone -
+    it renders every configured (non-empty) field as "label: value" so admins
+    get something useful regardless of which app defines the filter.
+    """
+    skip = {"id", "name", "description"}
+    lines = []
+    for field in instance._meta.get_fields():
+        if not getattr(field, "concrete", False) or field.name in skip:
+            continue
+        try:
+            if field.many_to_many:
+                values = list(getattr(instance, field.name).all())
+                if not values:
+                    continue
+                value_str = ", ".join(str(v) for v in values)
+            elif field.is_relation:
+                value = getattr(instance, field.name)
+                if value is None:
+                    continue
+                value_str = str(value)
+            else:
+                value = getattr(instance, field.name)
+                if value in (None, ""):
+                    continue
+                value_str = str(value)
+        except Exception:
+            continue
+        label = getattr(field, "verbose_name", field.name)
+        lines.append(format_html("<div>{}: {}</div>", label, value_str))
+
+    verbose_name = instance._meta.verbose_name
+    if not lines:
+        return format_html('<span style="opacity:0.7;">{}</span>', verbose_name)
+    return format_html(
+        '<span style="opacity:0.7;">{}</span>'
+        '<div style="padding-left:{};">{}</div>',
+        verbose_name,
+        EXPLAIN_INDENT,
+        format_html_join("", "{}", ((l,) for l in lines))
+    )
 
 
 class GroupUpdateWebhook(models.Model):
@@ -49,6 +118,55 @@ class SmartFilter(models.Model):
         except:  # noqa: E722
             return f"Error: {self.content_type.app_label}:{self.content_type} {self.object_id} Not Found"
 
+    def _admin_edit_url(self):
+        """Admin change-page URL for the concrete filter object, or None if unavailable."""
+        try:
+            return reverse(
+                f"admin:{self.content_type.app_label}_{self.content_type.model}_change",
+                args=[self.object_id]
+            )
+        except NoReverseMatch:
+            return None
+
+    def explain(self) -> str:
+        """
+        HTML-safe, human-readable explanation of the bound filter's actual logic,
+        regardless of its concrete type. Guards against broken/dangling generic
+        relations so a single misconfigured filter can't break the whole tree.
+        """
+        try:
+            filter_obj = self.filter_object
+        except Exception as e:
+            return format_html('<span class="text-danger">Error loading filter: {}</span>', e)
+        if filter_obj is None:
+            return format_html(
+                '<span class="text-danger">Broken filter reference ({} id={})</span>',
+                self.content_type, self.object_id
+            )
+        try:
+            if hasattr(filter_obj, "explain"):
+                body = filter_obj.explain()
+            else:
+                body = _auto_explain(filter_obj)
+        except Exception as e:
+            return format_html('<span class="text-danger">Error explaining {}: {}</span>', filter_obj, e)
+
+        title = format_html(
+            "{}: {}", getattr(filter_obj, "name", ""), getattr(filter_obj, "description", "")
+        )
+        edit_url = self._admin_edit_url()
+        if edit_url:
+            header = format_html(
+                '<strong>{}</strong> <a href="{}" target="_blank">[edit]</a>', title, edit_url
+            )
+        else:
+            header = format_html("<strong>{}</strong>", title)
+
+        return format_html(
+            '<div>{}<div style="padding-left:{};">{}</div></div>',
+            header, EXPLAIN_INDENT, body
+        )
+
 
 class FilterBase(models.Model):
 
@@ -66,6 +184,14 @@ class FilterBase(models.Model):
 
     def audit_filter(self, users):
         raise NotImplementedError("Please Create an audit function!")
+
+    def explain(self) -> str:
+        """
+        HTML-safe, human-readable explanation of this filter's actual configured
+        logic (as opposed to its free-text `description`). Defaults to a generic
+        field dump; override on concrete filters for nicer wording.
+        """
+        return _auto_explain(self)
 
 
 class FilterExpression(FilterBase):
@@ -96,6 +222,22 @@ class FilterExpression(FilterBase):
     )
 
     negate_result = models.BooleanField(default=False)
+
+    def explain(self) -> str:
+        first_html = self.first_term.explain()
+        second_html = self.second_term.explain()
+        box = format_html(
+            '<div style="border-left:2px solid #888; padding-left:{};">'
+            '{}<div style="opacity:0.7;">{}</div>{}'
+            '</div>',
+            EXPLAIN_INDENT, first_html, self.operator.upper(), second_html
+        )
+        if self.negate_result:
+            return format_html(
+                '<div><span style="opacity:0.7;">NOT of the following:</span>{}</div>',
+                box
+            )
+        return box
 
     def process_filter(self, user: User):
         first = self.first_term.filter_object.process_filter(user)
@@ -173,6 +315,14 @@ class AltCorpFilter(FilterBase):
     exempt_corporations = models.ManyToManyField(
         EveCorporationInfo, related_name="corp_exempt_corporations", blank=True)
 
+    def explain(self) -> str:
+        try:
+            corp = format_html("{} [{}]", self.alt_corp.corporation_name, self.alt_corp.corporation_id)
+        except Exception:
+            corp = "an unknown/deleted corporation"
+        exempt = _format_exemptions_html(self.exempt_alliances.all(), self.exempt_corporations.all())
+        return format_html("User (or an alt) is in corporation <strong>{}</strong>{}", corp, exempt)
+
     def process_filter(self, user: User):
         return smart_filters.check_alt_corp_on_account(
             user, self.alt_corp.corporation_id,
@@ -206,6 +356,14 @@ class AltAllianceFilter(FilterBase):
         EveAllianceInfo, related_name="alli_exempt_alliances", blank=True)
     exempt_corporations = models.ManyToManyField(
         EveCorporationInfo, related_name="alli_exempt_corporations", blank=True)
+
+    def explain(self) -> str:
+        try:
+            alli = format_html("{} [{}]", self.alt_alli.alliance_name, self.alt_alli.alliance_id)
+        except Exception:
+            alli = "an unknown/deleted alliance"
+        exempt = _format_exemptions_html(self.exempt_alliances.all(), self.exempt_corporations.all())
+        return format_html("User (or an alt) is in alliance <strong>{}</strong>{}", alli, exempt)
 
     def process_filter(self, user: User):
         return smart_filters.check_alt_alli_on_account(user, self.alt_alli.alliance_id,
@@ -241,6 +399,13 @@ class UserInGroupFilter(FilterBase):
 
     reversed_logic = models.BooleanField(default=False)
 
+    def explain(self) -> str:
+        group_names = sorted(g.name for g in self.groups.all())
+        groups_html = ", ".join(group_names) if group_names else "(no groups configured)"
+        verb = "does NOT belong" if self.reversed_logic else "belongs"
+        exempt = _format_exemptions_html(self.exempt_alliances.all(), self.exempt_corporations.all())
+        return format_html("User {} to any of auth group(s) <strong>{}</strong>{}", verb, groups_html, exempt)
+
     def process_filter(self, user: User):
         result = smart_filters.check_group_on_account(
             user,
@@ -268,6 +433,13 @@ class AltFactionFilter(FilterBase):
         verbose_name_plural = verbose_name
 
     alt_faction = models.ForeignKey(EveFactionInfo, on_delete=models.CASCADE)
+
+    def explain(self) -> str:
+        try:
+            fac = format_html("{} [{}]", self.alt_faction.faction_name, self.alt_faction.faction_id)
+        except Exception:
+            fac = "an unknown/deleted faction"
+        return format_html("User (or an alt) is in faction <strong>{}</strong>", fac)
 
     def process_filter(self, user: User):
         return smart_filters.check_alt_fac_on_account(
@@ -319,6 +491,19 @@ class SmartGroup(models.Model):
 
     def __str__(self):
         return "Smart Group: %s" % self.group.name
+
+    def explain(self) -> str:
+        """Full HTML explanation of every requirement this group enforces, regardless of filter type."""
+        items = format_html_join(
+            "", '<div style="margin-top:0.5em;">{}</div>',
+            ((sf.explain(),) for sf in self.filters.all())
+        )
+        if not items:
+            return format_html("<em>No filters configured.</em>")
+        return format_html(
+            "<p>User must satisfy <strong>ALL</strong> of the following:</p>{}",
+            items
+        )
 
     def run_checks(self, user: User):
         output = []

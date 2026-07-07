@@ -43,6 +43,11 @@ class SmartfilterAdmin(admin.ModelAdmin):
         return False
 
     list_display = ["__str__", "grace_period"]
+    readonly_fields = ["full_explanation"]
+
+    @admin.display(description="Full Explanation")
+    def full_explanation(self, obj):
+        return obj.explain()
 
 
 @admin.register(SmartGroup)
@@ -50,7 +55,13 @@ class SmartGroupAdmin(admin.ModelAdmin):
     filter_horizontal = ["filters"]
     list_display = ["__str__", "enabled", "auto_group",
                     "include_in_updates", "can_grace", "last_scheduled", "last_run"]
-    readonly_fields = ["last_scheduled", "last_run", "last_run_timing"]
+    readonly_fields = ["last_scheduled", "last_run", "last_run_timing", "full_requirements"]
+
+    @admin.display(description="Full Requirements Explanation")
+    def full_requirements(self, obj):
+        if not obj.pk:
+            return "-"
+        return obj.explain()
 
 
 @admin.register(AltCorpFilter)
