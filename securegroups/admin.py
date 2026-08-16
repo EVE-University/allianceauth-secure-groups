@@ -1,10 +1,17 @@
+from django.apps import apps as django_apps
 from django.contrib import admin
 from django.utils.html import format_html
 
 # Register your models here.
 from .models import (
-    AltAllianceFilter, AltCorpFilter, FilterExpression, GracePeriodRecord,
-    GroupUpdateWebhook, SmartFilter, SmartGroup, UserInGroupFilter,
+    AltAllianceFilter, AltCorpFilter, AltFactionFilter, FilterExpression,
+    GracePeriodRecord, GroupUpdateWebhook, SmartFilter, SmartGroup,
+    UserInGroupFilter,
+)
+from .service_filters import (
+    DiscordActiveFilter, DiscourseActiveFilter, Ips4ActiveFilter,
+    MumbleActiveFilter, OpenfireActiveFilter, Phpbb3ActiveFilter,
+    SmfActiveFilter, Teamspeak3ActiveFilter, XenforoActiveFilter,
 )
 
 
@@ -36,13 +43,25 @@ class SmartfilterAdmin(admin.ModelAdmin):
         return False
 
     list_display = ["__str__", "grace_period"]
+    readonly_fields = ["full_explanation"]
+
+    @admin.display(description="Full Explanation")
+    def full_explanation(self, obj):
+        return obj.explain()
 
 
 @admin.register(SmartGroup)
 class SmartGroupAdmin(admin.ModelAdmin):
     filter_horizontal = ["filters"]
     list_display = ["__str__", "enabled", "auto_group",
-                    "include_in_updates", "can_grace"]
+                    "include_in_updates", "can_grace", "last_scheduled", "last_run"]
+    readonly_fields = ["last_scheduled", "last_run", "last_run_timing", "full_requirements"]
+
+    @admin.display(description="Full Requirements Explanation")
+    def full_requirements(self, obj):
+        if not obj.pk:
+            return "-"
+        return obj.explain()
 
 
 @admin.register(AltCorpFilter)
@@ -90,9 +109,32 @@ class AltAlliAdmin(admin.ModelAdmin):
     filter_horizontal = ["exempt_alliances", "exempt_corporations"]
 
 
+@admin.register(AltFactionFilter)
+class AltFactionAdmin(admin.ModelAdmin):
+    list_select_related = ["alt_faction"]
+    list_display = ["__str__", "alt_faction"]
+    raw_id_fields = ["alt_faction"]
+
+
 @admin.register(FilterExpression)
 class FilterExpressionAdmin(admin.ModelAdmin):
     list_display = ["__str__",]
 
 
 admin.site.register(GroupUpdateWebhook)
+
+_SERVICE_FILTER_ADMINS = [
+    ("allianceauth.services.modules.discord",    DiscordActiveFilter),
+    ("allianceauth.services.modules.mumble",     MumbleActiveFilter),
+    ("allianceauth.services.modules.teamspeak3", Teamspeak3ActiveFilter),
+    ("allianceauth.services.modules.openfire",   OpenfireActiveFilter),
+    ("allianceauth.services.modules.phpbb3",     Phpbb3ActiveFilter),
+    ("allianceauth.services.modules.smf",        SmfActiveFilter),
+    ("allianceauth.services.modules.xenforo",    XenforoActiveFilter),
+    ("allianceauth.services.modules.discourse",  DiscourseActiveFilter),
+    ("allianceauth.services.modules.ips4",       Ips4ActiveFilter),
+]
+
+for _app_path, _filter_cls in _SERVICE_FILTER_ADMINS:
+    if django_apps.is_installed(_app_path):
+        admin.site.register(_filter_cls)
